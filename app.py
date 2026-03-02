@@ -44,7 +44,7 @@ PRESS_NAME_MAP = {
     "asiae": "아시아경제",
 }
 
-SHEET_NAMES = ("inbox", "saved", "corrections", "config")
+SHEET_NAMES = ("inbox", "saved", "corrections", "config", "keyword_results")
 
 
 def _dt_to_iso(dt: datetime) -> str:
@@ -186,6 +186,7 @@ def load_all_from_sheets() -> Optional[Dict[str, Any]]:
             "correction_items": [],
             "keywords": ["삼성화재"],
             "folders": ["보도자료", "기획기사", "위기관리", "경쟁사 동향"],
+            "keyword_search_results": [],
         }
         # inbox
         try:
@@ -260,6 +261,27 @@ def load_all_from_sheets() -> Optional[Dict[str, Any]]:
                     out["folders"] = [x.strip() for x in v.split(",") if x.strip()] or out["folders"]
         except Exception:
             pass
+        # keyword_search_results
+        try:
+            ws = sh.worksheet("keyword_results")
+            rows = ws.get_all_records()
+            for r in rows:
+                if not r.get("id"):
+                    continue
+                out["keyword_search_results"].append({
+                    "id": r.get("id", ""),
+                    "title": r.get("title", ""),
+                    "press": r.get("press", ""),
+                    "published_at": _iso_to_dt(r.get("published_at", "")),
+                    "link": r.get("link", ""),
+                    "summary": r.get("summary", ""),
+                    "query_keyword": r.get("query_keyword", ""),
+                    "is_negative": str(r.get("is_negative", "")).lower() in ("true", "1", "yes"),
+                    "negative_hits": r.get("negative_hits", ""),
+                    "collected_at": _iso_to_dt(r.get("collected_at", "")),
+                })
+        except Exception:
+            pass
         return out
     except Exception:
         return None
@@ -330,6 +352,24 @@ def save_all_to_sheets() -> bool:
         ws = sh.worksheet("config")
         ws.clear()
         ws.update([["key", "value"], ["keywords", ",".join(st.session_state.get("keywords", ["삼성화재"]))], ["folders", ",".join(st.session_state.get("folders", []))]], "A1")
+        # keyword_search_results
+        ws = sh.worksheet("keyword_results")
+        ws.clear()
+        rows = [["id", "title", "press", "published_at", "link", "summary", "query_keyword", "is_negative", "negative_hits", "collected_at"]]
+        for a in st.session_state.get("keyword_search_results", []):
+            rows.append([
+                a.get("id", ""),
+                a.get("title", ""),
+                a.get("press", ""),
+                _dt_to_iso(a.get("published_at")),
+                a.get("link", ""),
+                a.get("summary", ""),
+                a.get("query_keyword", ""),
+                str(a.get("is_negative", False)),
+                a.get("negative_hits", ""),
+                _dt_to_iso(a.get("collected_at")),
+            ])
+        ws.update(rows, "A1")
         return True
     except Exception:
         return False
@@ -452,12 +492,14 @@ def init_state() -> None:
             st.session_state.inbox_articles = data.get("inbox_articles", [])
             st.session_state.saved_articles = data.get("saved_articles", [])
             st.session_state.correction_items = data.get("correction_items", [])
+            st.session_state.keyword_search_results = data.get("keyword_search_results", [])
         else:
             st.session_state.keywords = ["삼성화재"]
             st.session_state.folders = ["보도자료", "기획기사", "위기관리", "경쟁사 동향"]
             st.session_state.inbox_articles = []
             st.session_state.saved_articles = []
             st.session_state.correction_items = []
+            st.session_state.keyword_search_results = []
 
     if "alerts" not in st.session_state:
         st.session_state.alerts = []
@@ -612,12 +654,17 @@ def collect_news_from_naver(
     start_date: Any = None,
     end_date: Any = None,
     keywords_override: Optional[List[str]] = None,
+    target: str = "inbox",
 ) -> Tuple[int, str]:
     from datetime import date as date_cls
 
     client_id, client_secret = get_naver_credentials()
     if not (client_id and client_secret):
         return 0, "no_key"
+
+    use_keyword_results = target == "keyword_search_results"
+    if use_keyword_results and "keyword_search_results" not in st.session_state:
+        st.session_state.keyword_search_results = []
 
     endpoint = "https://openapi.naver.com/v1/search/news.json"
     headers = {
@@ -633,7 +680,8 @@ def collect_news_from_naver(
     end_d = end_date if isinstance(end_date, date_cls) else (end_date.date() if end_date and hasattr(end_date, "date") else None)
     use_date_filter = start_d is not None and end_d is not None
 
-    existing_links = {a["link"] for a in st.session_state.inbox_articles}
+    target_list = st.session_state.keyword_search_results if use_keyword_results else st.session_state.inbox_articles
+    existing_links = {a["link"] for a in target_list}
     added = 0
     display_per_page = 100 if use_date_filter else 20
     max_start = 1001 - display_per_page
@@ -663,7 +711,7 @@ def collect_news_from_naver(
             summary=summary,
             query_keyword=query_keyword,
         )
-        st.session_state.inbox_articles.insert(0, article)
+        target_list.insert(0, article)
         existing_links.add(link)
         added += 1
         return False
@@ -752,6 +800,7 @@ def draw_sidebar() -> str:
         [
             "메인 대시보드",
             "임시 보관함 (Inbox)",
+            "키워드 검색결과",
             "스크랩 DB 및 폴더 관리",
             "기사 수정 요청 관리",
         ],
@@ -825,7 +874,8 @@ def draw_sidebar() -> str:
         start_d = collect_start_d if use_date_range else None
         end_d = collect_end_d if use_date_range else None
         kw_override = collect_keywords_override if use_date_range and collect_keywords_override else None
-        added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d, keywords_override=kw_override)
+        dest = "keyword_search_results" if (use_date_range and kw_override) else "inbox"
+        added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d, keywords_override=kw_override, target=dest)
         refresh_alerts()
         if source == "api":
             st.sidebar.success(f"수집 완료: 네이버 API 기사 {added_count}건 추가")
@@ -1068,6 +1118,117 @@ def page_inbox() -> None:
                 st.success(f"{saved_count}건을 '{target_folder}' 폴더에 저장했습니다.")
 
 
+def page_keyword_search_results() -> None:
+    st.title("키워드 검색결과")
+    st.caption("기간·키워드 지정 검색으로 수집된 기사입니다. 필요한 기사만 선택해 영구 DB로 저장할 수 있습니다.")
+
+    results = st.session_state.get("keyword_search_results", [])
+    if not results:
+        st.info("키워드 검색결과가 없습니다. 사이드바에서 '기간 지정하여 수집' 후 검색할 키워드를 선택하고 수집을 실행하세요.")
+        return
+
+    st.subheader("기간 필터 (발행일 기준)")
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    with col_a:
+        kw_filter_start = st.date_input("시작일 (YY.MM.DD)", value=datetime.now().date() - timedelta(days=30), key="kw_start")
+    with col_b:
+        kw_filter_end = st.date_input("종료일 (YY.MM.DD)", value=datetime.now().date(), key="kw_end")
+    with col_c:
+        st.caption("해당 기간에 발행된 기사만 표시합니다.")
+    if kw_filter_start > kw_filter_end:
+        kw_filter_start, kw_filter_end = kw_filter_end, kw_filter_start
+
+    target_folder = st.selectbox("저장할 섹션(폴더) 선택", st.session_state.folders, key="kw_target_folder")
+
+    results_sorted = sorted(results, key=lambda x: x["published_at"], reverse=True)
+    results_sorted = [
+        a for a in results_sorted
+        if (a["published_at"].date() if hasattr(a["published_at"], "date") else a["published_at"]) >= kw_filter_start
+        and (a["published_at"].date() if hasattr(a["published_at"], "date") else a["published_at"]) <= kw_filter_end
+    ]
+    if not results_sorted:
+        st.info("해당 기간에 해당하는 기사가 없습니다. 기간을 넓혀 보세요.")
+        return
+
+    registered_keywords = [k for k in st.session_state.keywords if k.strip()]
+    tab_labels = ["전체"] + registered_keywords if registered_keywords else ["전체"]
+    tabs = st.tabs(tab_labels)
+
+    for idx, (tab, label) in enumerate(zip(tabs, tab_labels)):
+        with tab:
+            if label == "전체":
+                filtered = results_sorted
+            else:
+                filtered = [a for a in results_sorted if a["query_keyword"] == label]
+            if not filtered:
+                st.info(f"'{label}' 키워드 기사 없음")
+                continue
+            table_data = [
+                {
+                    "선택": False,
+                    "제목": a["title"],
+                    "언론사": normalize_press_name(a["press"], a["link"]),
+                    "일시": fmt_dt(a["published_at"]),
+                    "키워드": a["query_keyword"],
+                    "부정키워드": a["negative_hits"],
+                    "기사링크": a["link"],
+                    "_id": a["id"],
+                }
+                for a in filtered
+            ]
+            df = pd.DataFrame(table_data)
+            current_editor = st.data_editor(
+                df,
+                hide_index=True,
+                use_container_width=True,
+                disabled=["제목", "일시", "키워드", "부정키워드", "기사링크", "_id"],
+                column_config={
+                    "_id": None,
+                    "선택": st.column_config.CheckboxColumn("선택"),
+                    "제목": st.column_config.TextColumn("제목", width="large"),
+                    "기사링크": st.column_config.LinkColumn("기사 링크"),
+                },
+                key=f"kw_editor_{idx}_{label}",
+            )
+            save_clicked = st.button("선택한 기사 영구 저장하기", type="primary", key=f"kw_save_{idx}_{label}")
+            if save_clicked:
+                selected_ids = current_editor.loc[current_editor["선택"] == True, "_id"].tolist()
+                if not selected_ids:
+                    st.warning("저장할 기사를 먼저 선택해 주세요.")
+                    continue
+                saved_count = 0
+                existing_ids = {a["article_id"] for a in st.session_state.saved_articles}
+                edited_rows_by_id = {row["_id"]: row.to_dict() for _, row in current_editor.iterrows()}
+                for article in filtered:
+                    if article["id"] in selected_ids and article["id"] not in existing_ids:
+                        edited_row = edited_rows_by_id.get(article["id"], {})
+                        edited_press = str(edited_row.get("언론사", article["press"])).strip()
+                        final_press = (
+                            normalize_press_name(edited_press, article["link"])
+                            if edited_press
+                            else normalize_press_name(article["press"], article["link"])
+                        )
+                        st.session_state.saved_articles.append({
+                            "saved_id": str(uuid.uuid4())[:8],
+                            "article_id": article["id"],
+                            "folder": target_folder,
+                            "saved_at": datetime.now(),
+                            "title": article["title"],
+                            "press": final_press,
+                            "published_at": article["published_at"],
+                            "link": article["link"],
+                            "summary": article["summary"],
+                            "negative_hits": article["negative_hits"],
+                        })
+                        saved_count += 1
+                st.success(f"{saved_count}건을 '{target_folder}' 폴더에 저장했습니다.")
+
+    if st.button("키워드 검색결과 비우기", key="kw_clear_btn"):
+        st.session_state.keyword_search_results = []
+        st.success("키워드 검색결과를 비웠습니다.")
+        st.rerun()
+
+
 def page_saved_db() -> None:
     st.title("스크랩 DB 및 폴더 관리")
     st.caption("영구 저장된 기사와 폴더를 관리하고 엑셀로 내보낼 수 있습니다.")
@@ -1281,6 +1442,8 @@ def main() -> None:
         page_dashboard()
     elif page == "임시 보관함 (Inbox)":
         page_inbox()
+    elif page == "키워드 검색결과":
+        page_keyword_search_results()
     elif page == "스크랩 DB 및 폴더 관리":
         page_saved_db()
     elif page == "기사 수정 요청 관리":
