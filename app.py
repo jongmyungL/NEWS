@@ -20,6 +20,7 @@ try:
     from google.oauth2.service_account import Credentials
     _SHEETS_AVAILABLE = True
 except ImportError:
+    gspread = None
     _SHEETS_AVAILABLE = False
 
 
@@ -168,9 +169,29 @@ def _ensure_worksheets(sh: Any) -> None:
         existing = [ws.title for ws in sh.worksheets()]
         for name in SHEET_NAMES:
             if name not in existing:
-                sh.add_worksheet(title=name, rows=500, cols=20)
+                try:
+                    sh.add_worksheet(title=name, rows=500, cols=20)
+                except Exception:
+                    pass
     except Exception:
         pass
+
+
+def _ensure_keyword_results_worksheet(sh: Any) -> bool:
+    """keyword_results 시트가 없으면 생성 후 True, 이미 있으면 True, 실패 시 False."""
+    if not sh:
+        return False
+    try:
+        sh.worksheet("keyword_results")
+        return True
+    except Exception:
+        try:
+            existing = [ws.title for ws in sh.worksheets()]
+            if "keyword_results" not in existing:
+                sh.add_worksheet(title="keyword_results", rows=500, cols=20)
+            return True
+        except Exception:
+            return False
 
 
 def load_all_from_sheets() -> Optional[Dict[str, Any]]:
@@ -262,8 +283,9 @@ def load_all_from_sheets() -> Optional[Dict[str, Any]]:
                     out["folders"] = [x.strip() for x in v.split(",") if x.strip()] or out["folders"]
         except Exception:
             pass
-        # keyword_search_results
+        # keyword_search_results (시트 없으면 생성 후 로드)
         try:
+            _ensure_keyword_results_worksheet(sh)
             ws = sh.worksheet("keyword_results")
             rows = ws.get_all_records()
             for r in rows:
@@ -354,24 +376,29 @@ def save_all_to_sheets() -> bool:
         ws = sh.worksheet("config")
         ws.clear()
         ws.update([["key", "value"], ["keywords", ",".join(st.session_state.get("keywords", ["삼성화재"]))], ["folders", ",".join(st.session_state.get("folders", []))]], "A1")
-        # keyword_search_results
-        ws = sh.worksheet("keyword_results")
-        ws.clear()
-        rows = [["id", "title", "press", "published_at", "link", "summary", "query_keyword", "is_negative", "negative_hits", "collected_at"]]
-        for a in st.session_state.get("keyword_search_results", []):
-            rows.append([
-                a.get("id", ""),
-                a.get("title", ""),
-                a.get("press", ""),
-                _dt_to_iso(a.get("published_at")),
-                a.get("link", ""),
-                a.get("summary", ""),
-                a.get("query_keyword", ""),
-                str(a.get("is_negative", False)),
-                a.get("negative_hits", ""),
-                _dt_to_iso(a.get("collected_at")),
-            ])
-        ws.update(rows, "A1")
+        # keyword_search_results (시트 없으면 생성 후 저장)
+        if _ensure_keyword_results_worksheet(sh):
+            try:
+                ws = sh.worksheet("keyword_results")
+                ws.clear()
+                rows = [["id", "title", "press", "published_at", "link", "summary", "query_keyword", "is_negative", "negative_hits", "collected_at"]]
+                for a in st.session_state.get("keyword_search_results", []):
+                    rows.append([
+                        a.get("id", ""),
+                        a.get("title", ""),
+                        a.get("press", ""),
+                        _dt_to_iso(a.get("published_at")),
+                        a.get("link", ""),
+                        a.get("summary", ""),
+                        a.get("query_keyword", ""),
+                        str(a.get("is_negative", False)),
+                        a.get("negative_hits", ""),
+                        _dt_to_iso(a.get("collected_at")),
+                    ])
+                if rows:
+                    ws.update(rows, "A1")
+            except Exception:
+                pass
         return True
     except Exception:
         return False
@@ -906,6 +933,11 @@ def draw_sidebar() -> str:
             added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d, keywords_override=kw_override, target="keyword_search_results")
             refresh_alerts()
             if source == "api":
+                if sheets_ready():
+                    try:
+                        save_all_to_sheets()
+                    except Exception:
+                        pass
                 st.sidebar.success(f"수집 완료: 키워드 검색결과에 {added_count}건 추가")
             elif source == "no_key":
                 st.sidebar.warning("API 키가 없어 수집을 실행할 수 없습니다. `.env`를 확인해 주세요.")
