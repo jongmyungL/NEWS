@@ -611,6 +611,7 @@ def normalize_press_name(raw_press: str, link: str) -> str:
 def collect_news_from_naver(
     start_date: Any = None,
     end_date: Any = None,
+    keywords_override: Optional[List[str]] = None,
 ) -> Tuple[int, str]:
     from datetime import date as date_cls
 
@@ -623,8 +624,9 @@ def collect_news_from_naver(
         "X-Naver-Client-Id": client_id,
         "X-Naver-Client-Secret": client_secret,
     }
-    keywords = st.session_state.keywords or ["삼성화재"]
-    mode = (st.session_state.get("keyword_search_mode") or "OR").strip().upper()
+    keywords = (keywords_override if keywords_override else st.session_state.keywords) or ["삼성화재"]
+    use_date_filter = start_date is not None and end_date is not None
+    mode = (st.session_state.get("keyword_search_mode") or "OR").strip().upper() if use_date_filter else "OR"
     if mode != "AND":
         mode = "OR"
     start_d = start_date if isinstance(start_date, date_cls) else (start_date.date() if start_date and hasattr(start_date, "date") else None)
@@ -758,12 +760,6 @@ def draw_sidebar() -> str:
     st.sidebar.divider()
     with st.sidebar.expander("키워드 설정", expanded=False):
         st.caption("클릭했을 때만 펼쳐집니다. 여러 키워드를 등록해 수집할 수 있습니다.")
-        mode_choice = st.radio(
-            "키워드 검색 방식",
-            ["OR (키워드별 각각 검색)", "AND (모든 키워드 함께 검색)"],
-            index=0 if (st.session_state.get("keyword_search_mode") or "OR").startswith("OR") else 1,
-        )
-        st.session_state.keyword_search_mode = "AND" if "AND" in mode_choice else "OR"
 
         new_keyword = st.text_input("새 키워드 추가", placeholder="예: CEO 이름")
         if st.button("키워드 추가"):
@@ -800,17 +796,36 @@ def draw_sidebar() -> str:
 
     st.sidebar.divider()
     st.sidebar.write("### 수집 기간 (선택)")
-    st.sidebar.caption("지정 시 해당 기간 기사만 수집·추가 (최대 1000건, 여러 페이지 조회)")
+    st.sidebar.caption("지정 시 해당 기간·선택 키워드로만 수집 (최대 1000건)")
     use_date_range = st.sidebar.checkbox("기간 지정하여 수집", value=False, key="use_collect_date_range")
     collect_start_d = st.sidebar.date_input("기간 시작", value=datetime.now().date() - timedelta(days=7), key="collect_start")
     collect_end_d = st.sidebar.date_input("기간 끝", value=datetime.now().date(), key="collect_end")
+    collect_keywords_override = None
+    if use_date_range:
+        all_kw = st.session_state.keywords or ["삼성화재"]
+        if all_kw:
+            default_sel = all_kw if len(all_kw) <= 10 else all_kw[:10]
+            collect_keywords_override = st.sidebar.multiselect(
+                "검색할 키워드 선택",
+                all_kw,
+                default=default_sel,
+                key="collect_keywords_select",
+            )
+            mode_choice = st.sidebar.radio(
+                "키워드 검색 방식",
+                ["OR (선택 키워드별 각각 검색)", "AND (선택 키워드 모두 포함 검색)"],
+                index=0 if (st.session_state.get("keyword_search_mode") or "OR").startswith("OR") else 1,
+                key="collect_mode_radio",
+            )
+            st.session_state.keyword_search_mode = "AND" if "AND" in mode_choice else "OR"
     if use_date_range and collect_start_d > collect_end_d:
         st.sidebar.warning("기간 시작이 기간 끝보다 늦습니다. 기간 끝을 더 뒤로 설정하세요.")
 
     if st.sidebar.button("지금 뉴스 수집 실행"):
         start_d = collect_start_d if use_date_range else None
         end_d = collect_end_d if use_date_range else None
-        added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d)
+        kw_override = collect_keywords_override if use_date_range and collect_keywords_override else None
+        added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d, keywords_override=kw_override)
         refresh_alerts()
         if source == "api":
             st.sidebar.success(f"수집 완료: 네이버 API 기사 {added_count}건 추가")
