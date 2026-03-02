@@ -310,6 +310,38 @@ def load_all_from_sheets() -> Optional[Dict[str, Any]]:
         return None
 
 
+def save_keyword_search_results_to_sheets() -> bool:
+    """키워드 검색결과만 구글 시트에 저장. 성공 여부 반환. (수집 직후 즉시 호출용)"""
+    if not _SHEETS_AVAILABLE:
+        return False
+    sh = _open_spreadsheet()
+    if not sh:
+        return False
+    if not _ensure_keyword_results_worksheet(sh):
+        return False
+    try:
+        ws = sh.worksheet("keyword_results")
+        ws.clear()
+        rows = [["id", "title", "press", "published_at", "link", "summary", "query_keyword", "is_negative", "negative_hits", "collected_at"]]
+        for a in st.session_state.get("keyword_search_results", []):
+            rows.append([
+                a.get("id", ""),
+                a.get("title", ""),
+                a.get("press", ""),
+                _dt_to_iso(a.get("published_at")),
+                a.get("link", ""),
+                a.get("summary", ""),
+                a.get("query_keyword", ""),
+                str(a.get("is_negative", False)),
+                a.get("negative_hits", ""),
+                _dt_to_iso(a.get("collected_at")),
+            ])
+        ws.update(rows, "A1")
+        return True
+    except Exception:
+        return False
+
+
 def save_all_to_sheets() -> bool:
     """현재 session_state 데이터를 스프레드시트에 저장. 성공 여부 반환."""
     if not _SHEETS_AVAILABLE:
@@ -319,6 +351,8 @@ def save_all_to_sheets() -> bool:
         return False
     try:
         _ensure_worksheets(sh)
+        # 키워드 검색결과를 가장 먼저 저장 (다른 시트 저장 실패해도 유지되도록)
+        save_keyword_search_results_to_sheets()
         # inbox
         ws = sh.worksheet("inbox")
         ws.clear()
@@ -376,29 +410,6 @@ def save_all_to_sheets() -> bool:
         ws = sh.worksheet("config")
         ws.clear()
         ws.update([["key", "value"], ["keywords", ",".join(st.session_state.get("keywords", ["삼성화재"]))], ["folders", ",".join(st.session_state.get("folders", []))]], "A1")
-        # keyword_search_results (시트 없으면 생성 후 저장)
-        if _ensure_keyword_results_worksheet(sh):
-            try:
-                ws = sh.worksheet("keyword_results")
-                ws.clear()
-                rows = [["id", "title", "press", "published_at", "link", "summary", "query_keyword", "is_negative", "negative_hits", "collected_at"]]
-                for a in st.session_state.get("keyword_search_results", []):
-                    rows.append([
-                        a.get("id", ""),
-                        a.get("title", ""),
-                        a.get("press", ""),
-                        _dt_to_iso(a.get("published_at")),
-                        a.get("link", ""),
-                        a.get("summary", ""),
-                        a.get("query_keyword", ""),
-                        str(a.get("is_negative", False)),
-                        a.get("negative_hits", ""),
-                        _dt_to_iso(a.get("collected_at")),
-                    ])
-                if rows:
-                    ws.update(rows, "A1")
-            except Exception:
-                pass
         return True
     except Exception:
         return False
@@ -934,10 +945,10 @@ def draw_sidebar() -> str:
             refresh_alerts()
             if source == "api":
                 if sheets_ready():
-                    try:
-                        save_all_to_sheets()
-                    except Exception:
-                        pass
+                    if save_keyword_search_results_to_sheets():
+                        st.sidebar.caption("키워드 검색결과를 구글 시트에 저장했습니다.")
+                    else:
+                        st.sidebar.warning("키워드 검색결과 구글 시트 저장에 실패했습니다. 하단 'Google Sheets 연동 점검'을 확인해 주세요.")
                 st.sidebar.success(f"수집 완료: 키워드 검색결과에 {added_count}건 추가")
             elif source == "no_key":
                 st.sidebar.warning("API 키가 없어 수집을 실행할 수 없습니다. `.env`를 확인해 주세요.")
@@ -1204,6 +1215,8 @@ def page_inbox() -> None:
 def page_keyword_search_results() -> None:
     st.title("키워드 검색결과")
     st.caption("기간·키워드 지정 검색으로 수집된 기사입니다. 필요한 기사만 선택해 영구 DB로 저장할 수 있습니다.")
+    if sheets_ready():
+        st.caption("데이터는 구글 시트에 자동 저장됩니다. 새로고침 후에도 유지됩니다.")
 
     results = st.session_state.get("keyword_search_results", [])
     if not results:
@@ -1335,10 +1348,23 @@ def page_keyword_search_results() -> None:
                         saved_count += 1
                 st.success(f"{saved_count}건을 '{target_folder}' 폴더에 저장했습니다.")
 
-    if st.button("키워드 검색결과 비우기", key="kw_clear_btn"):
-        st.session_state.keyword_search_results = []
-        st.success("키워드 검색결과를 비웠습니다.")
-        st.rerun()
+    col_save, col_clear = st.columns(2)
+    with col_save:
+        if sheets_ready() and st.button("지금 구글 시트에 저장", key="kw_manual_save"):
+            if save_keyword_search_results_to_sheets():
+                st.success("구글 시트에 저장했습니다.")
+            else:
+                st.error("저장에 실패했습니다. Google Sheets 연동을 확인해 주세요.")
+    with col_clear:
+        if st.button("키워드 검색결과 비우기", key="kw_clear_btn"):
+            st.session_state.keyword_search_results = []
+            if sheets_ready():
+                try:
+                    save_keyword_search_results_to_sheets()
+                except Exception:
+                    pass
+            st.success("키워드 검색결과를 비웠습니다.")
+            st.rerun()
 
 
 def page_saved_db() -> None:
