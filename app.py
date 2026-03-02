@@ -65,7 +65,50 @@ def _get_sheets_credentials() -> Optional[Dict[str, Any]]:
     if not _SHEETS_AVAILABLE:
         return None
     load_dotenv()
-    # 1) st.secrets: gcp_credentials_json (한 줄 JSON) 또는 [gcp_credentials] 섹션
+
+    def from_section(section: Any) -> Optional[Dict[str, Any]]:
+        if section is None:
+            return None
+        try:
+            if isinstance(section, Mapping):
+                d = dict(section)
+            elif hasattr(section, "to_dict"):
+                d = section.to_dict()
+            else:
+                d = dict(section) if hasattr(section, "items") else {}
+            if not d.get("private_key"):
+                return None
+            return {
+                "type": d.get("type", "service_account"),
+                "project_id": d.get("project_id", ""),
+                "private_key_id": d.get("private_key_id", ""),
+                "private_key": d.get("private_key", ""),
+                "client_email": d.get("client_email", ""),
+                "client_id": d.get("client_id", ""),
+                "auth_uri": d.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
+                "token_uri": d.get("token_uri", "https://oauth2.googleapis.com/token"),
+                "auth_provider_x509_cert_url": d.get("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"),
+                "client_x509_cert_url": d.get("client_x509_cert_url", ""),
+            }
+        except Exception:
+            return None
+
+    # 1) [gcp_credentials] 섹션 (Streamlit Cloud에서 권장 - 여러 줄로 넣기 쉬움)
+    try:
+        section = None
+        if hasattr(st.secrets, "get"):
+            section = st.secrets.get("gcp_credentials")
+        if section is None and hasattr(st.secrets, "gcp_credentials"):
+            section = getattr(st.secrets, "gcp_credentials", None)
+        if hasattr(st.secrets, "to_dict"):
+            section = section or st.secrets.to_dict().get("gcp_credentials")
+        out = from_section(section)
+        if out:
+            return out
+    except Exception:
+        pass
+
+    # 2) gcp_credentials_json 한 줄
     try:
         raw = ""
         if hasattr(st.secrets, "get"):
@@ -81,16 +124,6 @@ def _get_sheets_credentials() -> Optional[Dict[str, Any]]:
             if not raw.rstrip().endswith("}"):
                 raw = raw.rstrip() + "}"
             return json.loads(raw)
-        section = st.secrets.get("gcp_credentials", None) if hasattr(st.secrets, "get") else getattr(st.secrets, "gcp_credentials", None)
-        if isinstance(section, Mapping):
-            d = dict(section)
-            if d.get("private_key"):
-                return d
-        if hasattr(st.secrets, "to_dict"):
-            sec = st.secrets.to_dict()
-            section = sec.get("gcp_credentials", {})
-            if isinstance(section, dict) and section.get("private_key"):
-                return section
     except Exception:
         pass
     return None
