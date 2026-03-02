@@ -468,6 +468,9 @@ def init_state() -> None:
     if "last_auto_collect_at" not in st.session_state:
         st.session_state.last_auto_collect_at = datetime.now()
 
+    if "keyword_search_mode" not in st.session_state:
+        st.session_state.keyword_search_mode = "OR"
+
 
 def purge_old_inbox(days: int = 7) -> None:
     threshold = datetime.now() - timedelta(days=days)
@@ -605,9 +608,13 @@ def normalize_press_name(raw_press: str, link: str) -> str:
     return host_guess
 
 
-def collect_news_from_naver() -> Tuple[int, str]:
-    client_id, client_secret = get_naver_credentials()
+def collect_news_from_naver(
+    start_date: Any = None,
+    end_date: Any = None,
+) -> Tuple[int, str]:
+    from datetime import date as date_cls
 
+    client_id, client_secret = get_naver_credentials()
     if not (client_id and client_secret):
         return 0, "no_key"
 
@@ -617,45 +624,92 @@ def collect_news_from_naver() -> Tuple[int, str]:
         "X-Naver-Client-Secret": client_secret,
     }
     keywords = st.session_state.keywords or ["삼성화재"]
+    mode = (st.session_state.get("keyword_search_mode") or "OR").strip().upper()
+    if mode != "AND":
+        mode = "OR"
+    start_d = start_date if isinstance(start_date, date_cls) else (start_date.date() if start_date and hasattr(start_date, "date") else None)
+    end_d = end_date if isinstance(end_date, date_cls) else (end_date.date() if end_date and hasattr(end_date, "date") else None)
+    use_date_filter = start_d is not None and end_d is not None
+
     existing_links = {a["link"] for a in st.session_state.inbox_articles}
     added = 0
+    display_per_page = 100 if use_date_filter else 20
+    max_start = 1001 - display_per_page
+
+    def process_item(item: Dict, query_keyword: str) -> bool:
+        """기사 처리. 날짜 필터 사용 시 start_d 이전 기사면 True(페이지 중단 신호)."""
+        nonlocal added
+        link = item.get("originallink") or item.get("link") or ""
+        if not link or link in existing_links:
+            return False
+        pub_dt = parse_naver_pub_date(item.get("pubDate", ""))
+        pub_d = pub_dt.date() if hasattr(pub_dt, "date") else pub_dt
+        if use_date_filter and start_d and end_d:
+            if pub_d < start_d:
+                return True
+            if pub_d > end_d:
+                return False
+        title = clean_html(item.get("title", "제목 없음"))
+        summary = clean_html(item.get("description", ""))
+        press_raw = clean_html(item.get("source", ""))
+        press = normalize_press_name(press_raw, link)
+        article = make_article(
+            title=title,
+            press=press,
+            published_at=pub_dt,
+            link=link,
+            summary=summary,
+            query_keyword=query_keyword,
+        )
+        st.session_state.inbox_articles.insert(0, article)
+        existing_links.add(link)
+        added += 1
+        return False
 
     try:
-        for keyword in keywords:
-            params = {
-                "query": keyword,
-                "display": 20,
-                "start": 1,
-                "sort": "date",
-            }
-            response = requests.get(endpoint, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
-            payload = response.json()
-            items = payload.get("items", [])
-
-            for item in items:
-                link = item.get("originallink") or item.get("link") or ""
-                if not link or link in existing_links:
+        if mode == "AND":
+            query = " ".join(kw.strip() for kw in keywords if kw.strip())
+            if not query:
+                return 0, "api"
+            start_idx = 1
+            while start_idx <= max_start:
+                params = {"query": query, "display": display_per_page, "start": start_idx, "sort": "date"}
+                response = requests.get(endpoint, headers=headers, params=params, timeout=15)
+                response.raise_for_status()
+                items = response.json().get("items", [])
+                if not items:
+                    break
+                stop_early = False
+                for item in items:
+                    if process_item(item, query):
+                        stop_early = True
+                        break
+                if stop_early:
+                    break
+                start_idx += display_per_page
+            return added, "api"
+        else:
+            for keyword in keywords:
+                kw = (keyword or "").strip()
+                if not kw:
                     continue
-
-                title = clean_html(item.get("title", "제목 없음"))
-                summary = clean_html(item.get("description", ""))
-                press_raw = clean_html(item.get("source", ""))
-                press = normalize_press_name(press_raw, link)
-                published_at = parse_naver_pub_date(item.get("pubDate", ""))
-
-                article = make_article(
-                    title=title,
-                    press=press,
-                    published_at=published_at,
-                    link=link,
-                    summary=summary,
-                    query_keyword=keyword,
-                )
-                st.session_state.inbox_articles.insert(0, article)
-                existing_links.add(link)
-                added += 1
-        return added, "api"
+                start_idx = 1
+                while start_idx <= max_start:
+                    params = {"query": kw, "display": display_per_page, "start": start_idx, "sort": "date"}
+                    response = requests.get(endpoint, headers=headers, params=params, timeout=15)
+                    response.raise_for_status()
+                    items = response.json().get("items", [])
+                    if not items:
+                        break
+                    stop_early = False
+                    for item in items:
+                        if process_item(item, kw):
+                            stop_early = True
+                            break
+                    if stop_early:
+                        break
+                    start_idx += display_per_page
+            return added, "api"
     except requests.RequestException:
         return 0, "error"
 
@@ -704,6 +758,12 @@ def draw_sidebar() -> str:
     st.sidebar.divider()
     with st.sidebar.expander("키워드 설정", expanded=False):
         st.caption("클릭했을 때만 펼쳐집니다. 여러 키워드를 등록해 수집할 수 있습니다.")
+        mode_choice = st.radio(
+            "키워드 검색 방식",
+            ["OR (키워드별 각각 검색)", "AND (모든 키워드 함께 검색)"],
+            index=0 if (st.session_state.get("keyword_search_mode") or "OR").startswith("OR") else 1,
+        )
+        st.session_state.keyword_search_mode = "AND" if "AND" in mode_choice else "OR"
 
         new_keyword = st.text_input("새 키워드 추가", placeholder="예: CEO 이름")
         if st.button("키워드 추가"):
@@ -739,51 +799,18 @@ def draw_sidebar() -> str:
             st.info("등록된 키워드가 없습니다.")
 
     st.sidebar.divider()
-    if naver_api_ready():
-        st.sidebar.success("네이버 API 키가 설정되어 있습니다.")
-    else:
-        st.sidebar.warning(
-            "네이버 API 키를 찾지 못했습니다.\n로컬은 `.env`, 배포는 Streamlit `Secrets`를 확인하세요."
-        )
-
-    if st.sidebar.button("API 키 인식 상태 점검"):
-        cid, csec = get_naver_credentials()
-        if cid and csec:
-            st.sidebar.success("API 키 인식 성공")
-        else:
-            st.sidebar.error("API 키 인식 실패 (키 이름/배포 재시작 여부 확인 필요)")
-
-    st.sidebar.divider()
-    if sheets_ready():
-        st.sidebar.success("Google Sheets DB 연동됨 (데이터 영구 보존)")
-    else:
-        st.sidebar.caption("Google Sheets 미연동 시 새로고침하면 데이터가 초기화됩니다. 설정: GOOGLE_SHEETS_SETUP.md")
-    if st.sidebar.button("Google Sheets 연동 점검"):
-        msgs = []
-        sid = _get_sheet_id()
-        if not sid:
-            msgs.append("❌ google_sheet_id 없음 (secrets.toml 또는 환경변수 확인)")
-        else:
-            msgs.append(f"✅ 스프레드시트 ID 있음 (앞 8자: {sid[:8]}…)")
-        cred = _get_sheets_credentials()
-        if not cred:
-            msgs.append("❌ gcp_credentials_json 없거나 파싱 실패 (줄 앞에 # 있으면 제거, JSON은 { 로 시작)")
-        else:
-            msgs.append("✅ 서비스 계정 인증 정보 로드됨")
-        if sid and cred:
-            try:
-                sh = _open_spreadsheet()
-                if sh:
-                    msgs.append("✅ 스프레드시트 열기 성공 → 연동 정상")
-                else:
-                    msgs.append("❌ 스프레드시트 열기 실패 (해당 스프레드시트에 서비스 계정 이메일을 편집자로 공유했는지 확인)")
-            except Exception as e:
-                msgs.append(f"❌ 스프레드시트 접근 오류: {e}")
-        for m in msgs:
-            st.sidebar.write(m)
+    st.sidebar.write("### 수집 기간 (선택)")
+    st.sidebar.caption("지정 시 해당 기간 기사만 수집·추가 (최대 1000건, 여러 페이지 조회)")
+    use_date_range = st.sidebar.checkbox("기간 지정하여 수집", value=False, key="use_collect_date_range")
+    collect_start_d = st.sidebar.date_input("기간 시작", value=datetime.now().date() - timedelta(days=7), key="collect_start")
+    collect_end_d = st.sidebar.date_input("기간 끝", value=datetime.now().date(), key="collect_end")
+    if use_date_range and collect_start_d > collect_end_d:
+        st.sidebar.warning("기간 시작이 기간 끝보다 늦습니다. 기간 끝을 더 뒤로 설정하세요.")
 
     if st.sidebar.button("지금 뉴스 수집 실행"):
-        added_count, source = collect_news_from_naver()
+        start_d = collect_start_d if use_date_range else None
+        end_d = collect_end_d if use_date_range else None
+        added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d)
         refresh_alerts()
         if source == "api":
             st.sidebar.success(f"수집 완료: 네이버 API 기사 {added_count}건 추가")
@@ -807,6 +834,49 @@ def draw_sidebar() -> str:
         st.sidebar.caption(f"마지막 자동 수집: {fmt_dt(st.session_state.last_auto_collect_at)}")
     else:
         st.sidebar.caption("자동 수집이 꺼져 있습니다.")
+
+    st.sidebar.divider()
+    st.sidebar.write("---")
+    st.sidebar.write("### 네이버 API")
+    if naver_api_ready():
+        st.sidebar.success("네이버 API 키 설정됨")
+    else:
+        st.sidebar.warning("네이버 API 키 없음. `.env` 또는 Secrets 확인.")
+    if st.sidebar.button("API 키 인식 상태 점검", key="naver_check_btn"):
+        cid, csec = get_naver_credentials()
+        if cid and csec:
+            st.sidebar.success("API 키 인식 성공")
+        else:
+            st.sidebar.error("API 키 인식 실패")
+
+    st.sidebar.write("### Google Sheets DB")
+    if sheets_ready():
+        st.sidebar.success("Sheets 연동됨 (데이터 영구 보존)")
+    else:
+        st.sidebar.caption("Sheets 미연동 시 새로고침 시 데이터 초기화. GOOGLE_SHEETS_SETUP.md 참고.")
+    if st.sidebar.button("Google Sheets 연동 점검", key="sheets_check_btn"):
+        msgs = []
+        sid = _get_sheet_id()
+        if not sid:
+            msgs.append("❌ google_sheet_id 없음")
+        else:
+            msgs.append(f"✅ 스프레드시트 ID 있음 ({sid[:8]}…)")
+        cred = _get_sheets_credentials()
+        if not cred:
+            msgs.append("❌ gcp_credentials 없거나 파싱 실패")
+        else:
+            msgs.append("✅ 서비스 계정 로드됨")
+        if sid and cred:
+            try:
+                sh = _open_spreadsheet()
+                if sh:
+                    msgs.append("✅ 스프레드시트 열기 성공")
+                else:
+                    msgs.append("❌ 스프레드시트 열기 실패 (편집자 공유 확인)")
+            except Exception as e:
+                msgs.append(f"❌ 오류: {e}")
+        for m in msgs:
+            st.sidebar.write(m)
 
     return page
 
@@ -868,6 +938,17 @@ def page_inbox() -> None:
         st.info("임시 보관함에 기사가 없습니다.")
         return
 
+    st.subheader("기간 필터 (발행일 기준)")
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    with col_a:
+        filter_start = st.date_input("시작일 (YY.MM.DD)", value=datetime.now().date() - timedelta(days=30), key="inbox_start")
+    with col_b:
+        filter_end = st.date_input("종료일 (YY.MM.DD)", value=datetime.now().date(), key="inbox_end")
+    with col_c:
+        st.caption("해당 기간에 발행된 기사만 표시합니다.")
+    if filter_start > filter_end:
+        filter_start, filter_end = filter_end, filter_start
+
     target_folder = st.selectbox("저장할 섹션(폴더) 선택", st.session_state.folders)
 
     inbox_sorted = sorted(
@@ -875,7 +956,14 @@ def page_inbox() -> None:
         key=lambda x: x["published_at"],
         reverse=True,
     )
-
+    inbox_sorted = [
+        a for a in inbox_sorted
+        if (a["published_at"].date() if hasattr(a["published_at"], "date") else a["published_at"]) >= filter_start
+        and (a["published_at"].date() if hasattr(a["published_at"], "date") else a["published_at"]) <= filter_end
+    ]
+    if not inbox_sorted:
+        st.info("해당 기간에 해당하는 기사가 없습니다. 기간을 넓혀 보세요.")
+        return
     registered_keywords = [k for k in st.session_state.keywords if k.strip()]
     tab_labels = ["전체"] + registered_keywords if registered_keywords else ["전체"]
     tabs = st.tabs(tab_labels)
@@ -969,6 +1057,17 @@ def page_saved_db() -> None:
     st.title("스크랩 DB 및 폴더 관리")
     st.caption("영구 저장된 기사와 폴더를 관리하고 엑셀로 내보낼 수 있습니다.")
 
+    st.subheader("기간 필터 (발행일 기준)")
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    with col_a:
+        db_filter_start = st.date_input("시작일 (YY.MM.DD)", value=datetime.now().date() - timedelta(days=30), key="db_start")
+    with col_b:
+        db_filter_end = st.date_input("종료일 (YY.MM.DD)", value=datetime.now().date(), key="db_end")
+    with col_c:
+        st.caption("해당 기간에 발행된 스크랩 기사만 표시합니다.")
+    if db_filter_start > db_filter_end:
+        db_filter_start, db_filter_end = db_filter_end, db_filter_start
+
     st.subheader("폴더 관리")
     add_col, delete_col = st.columns(2)
     with add_col:
@@ -1018,9 +1117,14 @@ def page_saved_db() -> None:
     saved = st.session_state.saved_articles
     if selected_folder != "전체":
         saved = [s for s in saved if s["folder"] == selected_folder]
+    saved = [
+        s for s in saved
+        if (s["published_at"].date() if hasattr(s["published_at"], "date") else s["published_at"]) >= db_filter_start
+        and (s["published_at"].date() if hasattr(s["published_at"], "date") else s["published_at"]) <= db_filter_end
+    ]
 
     if not saved:
-        st.info("저장된 기사가 없습니다.")
+        st.info("저장된 기사가 없거나 해당 기간에 해당하는 기사가 없습니다.")
         return
 
     display_df = pd.DataFrame(
