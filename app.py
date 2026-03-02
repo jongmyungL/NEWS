@@ -227,6 +227,7 @@ def load_all_from_sheets() -> Optional[Dict[str, Any]]:
                     "link": r.get("link", ""),
                     "summary": r.get("summary", ""),
                     "negative_hits": r.get("negative_hits", ""),
+                    "summary_50": r.get("summary_50", ""),
                 })
         except Exception:
             pass
@@ -317,7 +318,7 @@ def save_all_to_sheets() -> bool:
         # saved
         ws = sh.worksheet("saved")
         ws.clear()
-        rows = [["saved_id", "article_id", "folder", "saved_at", "title", "press", "published_at", "link", "summary", "negative_hits"]]
+        rows = [["saved_id", "article_id", "folder", "saved_at", "title", "press", "published_at", "link", "summary", "negative_hits", "summary_50"]]
         for a in st.session_state.get("saved_articles", []):
             rows.append([
                 a.get("saved_id", ""),
@@ -330,6 +331,7 @@ def save_all_to_sheets() -> bool:
                 a.get("link", ""),
                 a.get("summary", ""),
                 a.get("negative_hits", ""),
+                a.get("summary_50", ""),
             ])
         ws.update(rows, "A1")
         # corrections
@@ -606,6 +608,14 @@ def naver_api_ready() -> bool:
 def clean_html(text: str) -> str:
     no_tags = re.sub(r"<[^>]+>", "", text or "")
     return unescape(no_tags).strip()
+
+
+def truncate_to_50_words(text: str) -> str:
+    """텍스트를 50단어 정도로 자른 요약 문자열 반환 (스크랩 시 저장, 엑셀 다운로드용)."""
+    if not (text or "").strip():
+        return ""
+    words = (text or "").split()
+    return " ".join(words[:50]).strip()
 
 
 def parse_naver_pub_date(value: str) -> datetime:
@@ -1100,6 +1110,7 @@ def page_inbox() -> None:
                             else normalize_press_name(article["press"], article["link"])
                         )
                         article["press"] = final_press
+                        summary_50 = truncate_to_50_words(article.get("summary") or article.get("title", ""))
                         st.session_state.saved_articles.append(
                             {
                                 "saved_id": str(uuid.uuid4())[:8],
@@ -1112,6 +1123,7 @@ def page_inbox() -> None:
                                 "link": article["link"],
                                 "summary": article["summary"],
                                 "negative_hits": article["negative_hits"],
+                                "summary_50": summary_50,
                             }
                         )
                         saved_count += 1
@@ -1150,18 +1162,25 @@ def page_keyword_search_results() -> None:
         st.info("해당 기간에 해당하는 기사가 없습니다. 기간을 넓혀 보세요.")
         return
 
-    registered_keywords = [k for k in st.session_state.keywords if k.strip()]
-    tab_labels = ["전체"] + registered_keywords if registered_keywords else ["전체"]
+    # AND 검색 시 query_keyword가 "A B" 형태이므로, 결과에 있는 query_keyword 기준으로 탭 구성
+    unique_query_keywords = sorted(set((a.get("query_keyword") or "").strip() for a in results_sorted if (a.get("query_keyword") or "").strip()))
+    tab_labels = ["전체"] + unique_query_keywords
     tabs = st.tabs(tab_labels)
+
+    def format_keyword_display(q: str) -> str:
+        """AND 검색 시 'A B' -> 'A + B' 형태로 표시."""
+        if not (q or "").strip():
+            return ""
+        return " + ".join((q or "").split())
 
     for idx, (tab, label) in enumerate(zip(tabs, tab_labels)):
         with tab:
             if label == "전체":
                 filtered = results_sorted
             else:
-                filtered = [a for a in results_sorted if a["query_keyword"] == label]
+                filtered = [a for a in results_sorted if (a.get("query_keyword") or "").strip() == label]
             if not filtered:
-                st.info(f"'{label}' 키워드 기사 없음")
+                st.info(f"'{format_keyword_display(label)}' 키워드 기사 없음")
                 continue
             table_data = [
                 {
@@ -1169,7 +1188,7 @@ def page_keyword_search_results() -> None:
                     "제목": a["title"],
                     "언론사": normalize_press_name(a["press"], a["link"]),
                     "일시": fmt_dt(a["published_at"]),
-                    "키워드": a["query_keyword"],
+                    "키워드": format_keyword_display(a.get("query_keyword", "")),
                     "부정키워드": a["negative_hits"],
                     "기사링크": a["link"],
                     "_id": a["id"],
@@ -1208,6 +1227,7 @@ def page_keyword_search_results() -> None:
                             if edited_press
                             else normalize_press_name(article["press"], article["link"])
                         )
+                        summary_50 = truncate_to_50_words(article.get("summary") or article.get("title", ""))
                         st.session_state.saved_articles.append({
                             "saved_id": str(uuid.uuid4())[:8],
                             "article_id": article["id"],
@@ -1219,6 +1239,7 @@ def page_keyword_search_results() -> None:
                             "link": article["link"],
                             "summary": article["summary"],
                             "negative_hits": article["negative_hits"],
+                            "summary_50": summary_50,
                         })
                         saved_count += 1
                 st.success(f"{saved_count}건을 '{target_folder}' 폴더에 저장했습니다.")
@@ -1320,7 +1341,22 @@ def page_saved_db() -> None:
         ]
     )
 
-    excel_export_df = display_df.drop(columns=["선택", "_saved_id"])
+    # 엑셀 다운로드용: 화면에 표시하지 않는 요약(50단어) 컬럼 포함
+    excel_export_df = pd.DataFrame(
+        [
+            {
+                "폴더": s["folder"],
+                "기사제목": s["title"],
+                "언론사": normalize_press_name(s["press"], s["link"]),
+                "발행일시": fmt_dt(s["published_at"]),
+                "저장일시": fmt_dt(s["saved_at"]),
+                "부정키워드": s["negative_hits"],
+                "요약(50단어)": s.get("summary_50", ""),
+                "링크": s["link"],
+            }
+            for s in sorted(saved, key=lambda x: x["saved_at"], reverse=True)
+        ]
+    )
     excel_bytes = to_excel_bytes(excel_export_df, "Saved_DB")
     st.download_button(
         label="엑셀 다운로드",
