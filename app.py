@@ -693,7 +693,8 @@ def collect_news_from_naver(
     target_list = st.session_state.keyword_search_results if use_keyword_results else st.session_state.inbox_articles
     existing_links = {a["link"] for a in target_list}
     added = 0
-    display_per_page = 100 if use_date_filter else 20
+    # 임시보관함 수집(기간 미지정): 키워드당 최신 30건만. 기간 지정 수집: 100건씩 페이지네이션
+    display_per_page = 100 if use_date_filter else 30
     max_start = 1001 - display_per_page
 
     def process_item(item: Dict, query_keyword: str) -> bool:
@@ -749,6 +750,7 @@ def collect_news_from_naver(
                 start_idx += display_per_page
             return added, "api"
         else:
+            # OR: 키워드별 검색. 임시보관함(기간 미지정)이면 키워드당 1페이지만(최신 30건), 기간 지정이면 페이지네이션
             for keyword in keywords:
                 kw = (keyword or "").strip()
                 if not kw:
@@ -769,6 +771,8 @@ def collect_news_from_naver(
                     if stop_early:
                         break
                     start_idx += display_per_page
+                    if not use_date_filter:
+                        break
             return added, "api"
     except requests.RequestException:
         return 0, "error"
@@ -853,9 +857,10 @@ def draw_sidebar() -> str:
         else:
             st.info("등록된 키워드가 없습니다.")
 
-        st.sidebar.caption("등록된 키워드로 최근 뉴스를 수집해 임시보관함에 넣습니다.")
+        st.sidebar.caption("등록된 키워드로 최근 뉴스를 수집해 임시보관함에 넣습니다. 키워드당 최신 30건, 누를 때마다 새 기사만 추가됩니다.")
         if st.sidebar.button("지금 뉴스 수집 (임시보관함)", key="btn_collect_inbox"):
-            added_count, source = collect_news_from_naver(start_date=None, end_date=None, keywords_override=None, target="inbox")
+            kw_list = [k for k in (st.session_state.keywords or []) if (k or "").strip()] or ["삼성화재"]
+            added_count, source = collect_news_from_naver(start_date=None, end_date=None, keywords_override=kw_list, target="inbox")
             refresh_alerts()
             if source == "api":
                 st.sidebar.success(f"수집 완료: 임시보관함에 {added_count}건 추가")
