@@ -853,9 +853,20 @@ def draw_sidebar() -> str:
         else:
             st.info("등록된 키워드가 없습니다.")
 
+        st.sidebar.caption("등록된 키워드로 최근 뉴스를 수집해 임시보관함에 넣습니다.")
+        if st.sidebar.button("지금 뉴스 수집 (임시보관함)", key="btn_collect_inbox"):
+            added_count, source = collect_news_from_naver(start_date=None, end_date=None, keywords_override=None, target="inbox")
+            refresh_alerts()
+            if source == "api":
+                st.sidebar.success(f"수집 완료: 임시보관함에 {added_count}건 추가")
+            elif source == "no_key":
+                st.sidebar.warning("API 키가 없어 수집을 실행할 수 없습니다. `.env`를 확인해 주세요.")
+            else:
+                st.sidebar.warning("네이버 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+
     st.sidebar.divider()
     st.sidebar.write("### 수집 기간 (선택)")
-    st.sidebar.caption("지정 시 해당 기간·선택 키워드로만 수집 (최대 1000건)")
+    st.sidebar.caption("기간·키워드 지정 검색 시 [키워드 검색결과] 페이지로 수집 (최대 1000건)")
     use_date_range = st.sidebar.checkbox("기간 지정하여 수집", value=False, key="use_collect_date_range")
     collect_start_d = st.sidebar.date_input("기간 시작", value=datetime.now().date() - timedelta(days=7), key="collect_start")
     collect_end_d = st.sidebar.date_input("기간 끝", value=datetime.now().date(), key="collect_end")
@@ -880,19 +891,21 @@ def draw_sidebar() -> str:
     if use_date_range and collect_start_d > collect_end_d:
         st.sidebar.warning("기간 시작이 기간 끝보다 늦습니다. 기간 끝을 더 뒤로 설정하세요.")
 
-    if st.sidebar.button("지금 뉴스 수집 실행"):
-        start_d = collect_start_d if use_date_range else None
-        end_d = collect_end_d if use_date_range else None
-        kw_override = collect_keywords_override if use_date_range and collect_keywords_override else None
-        dest = "keyword_search_results" if (use_date_range and kw_override) else "inbox"
-        added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d, keywords_override=kw_override, target=dest)
-        refresh_alerts()
-        if source == "api":
-            st.sidebar.success(f"수집 완료: 네이버 API 기사 {added_count}건 추가")
-        elif source == "no_key":
-            st.sidebar.warning("API 키가 없어 수집을 실행할 수 없습니다. `.env`를 확인해 주세요.")
+    if use_date_range and st.sidebar.button("기간 지정하여 수집 실행", key="btn_collect_date_range"):
+        start_d = collect_start_d
+        end_d = collect_end_d
+        kw_override = collect_keywords_override if collect_keywords_override else None
+        if not kw_override:
+            st.sidebar.warning("검색할 키워드를 하나 이상 선택해 주세요.")
         else:
-            st.sidebar.warning("네이버 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            added_count, source = collect_news_from_naver(start_date=start_d, end_date=end_d, keywords_override=kw_override, target="keyword_search_results")
+            refresh_alerts()
+            if source == "api":
+                st.sidebar.success(f"수집 완료: 키워드 검색결과에 {added_count}건 추가")
+            elif source == "no_key":
+                st.sidebar.warning("API 키가 없어 수집을 실행할 수 없습니다. `.env`를 확인해 주세요.")
+            else:
+                st.sidebar.warning("네이버 API 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.")
 
     if st.sidebar.button("임시 보관함 데이터 비우기"):
         st.session_state.inbox_articles = []
@@ -1039,6 +1052,27 @@ def page_inbox() -> None:
     if not inbox_sorted:
         st.info("해당 기간에 해당하는 기사가 없습니다. 기간을 넓혀 보세요.")
         return
+
+    inbox_export_df = pd.DataFrame([
+        {
+            "제목": a["title"],
+            "언론사": normalize_press_name(a["press"], a["link"]),
+            "일시": fmt_dt(a["published_at"]),
+            "키워드": a["query_keyword"],
+            "부정키워드": a["negative_hits"],
+            "요약(50단어)": truncate_to_50_words(a.get("summary") or a.get("title", "")),
+            "기사링크": a["link"],
+        }
+        for a in inbox_sorted
+    ])
+    st.download_button(
+        label="엑셀 다운로드 (현재 필터 기준)",
+        data=to_excel_bytes(inbox_export_df, "Inbox"),
+        file_name=f"pr_radar_inbox_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="inbox_excel_dl",
+    )
+
     registered_keywords = [k for k in st.session_state.keywords if k.strip()]
     tab_labels = ["전체"] + registered_keywords if registered_keywords else ["전체"]
     tabs = st.tabs(tab_labels)
@@ -1162,16 +1196,36 @@ def page_keyword_search_results() -> None:
         st.info("해당 기간에 해당하는 기사가 없습니다. 기간을 넓혀 보세요.")
         return
 
-    # AND 검색 시 query_keyword가 "A B" 형태이므로, 결과에 있는 query_keyword 기준으로 탭 구성
-    unique_query_keywords = sorted(set((a.get("query_keyword") or "").strip() for a in results_sorted if (a.get("query_keyword") or "").strip()))
-    tab_labels = ["전체"] + unique_query_keywords
-    tabs = st.tabs(tab_labels)
-
     def format_keyword_display(q: str) -> str:
         """AND 검색 시 'A B' -> 'A + B' 형태로 표시."""
         if not (q or "").strip():
             return ""
         return " + ".join((q or "").split())
+
+    results_export_df = pd.DataFrame([
+        {
+            "제목": a["title"],
+            "언론사": normalize_press_name(a["press"], a["link"]),
+            "일시": fmt_dt(a["published_at"]),
+            "키워드": format_keyword_display(a.get("query_keyword", "")),
+            "부정키워드": a["negative_hits"],
+            "요약(50단어)": truncate_to_50_words(a.get("summary") or a.get("title", "")),
+            "기사링크": a["link"],
+        }
+        for a in results_sorted
+    ])
+    st.download_button(
+        label="엑셀 다운로드 (현재 필터 기준)",
+        data=to_excel_bytes(results_export_df, "Keyword_Search_Results"),
+        file_name=f"pr_radar_keyword_results_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="keyword_results_excel_dl",
+    )
+
+    # AND 검색 시 query_keyword가 "A B" 형태이므로, 결과에 있는 query_keyword 기준으로 탭 구성
+    unique_query_keywords = sorted(set((a.get("query_keyword") or "").strip() for a in results_sorted if (a.get("query_keyword") or "").strip()))
+    tab_labels = ["전체"] + unique_query_keywords
+    tabs = st.tabs(tab_labels)
 
     for idx, (tab, label) in enumerate(zip(tabs, tab_labels)):
         with tab:
