@@ -725,6 +725,29 @@ def draw_sidebar() -> str:
         st.sidebar.success("Google Sheets DB 연동됨 (데이터 영구 보존)")
     else:
         st.sidebar.caption("Google Sheets 미연동 시 새로고침하면 데이터가 초기화됩니다. 설정: GOOGLE_SHEETS_SETUP.md")
+    if st.sidebar.button("Google Sheets 연동 점검"):
+        msgs = []
+        sid = _get_sheet_id()
+        if not sid:
+            msgs.append("❌ google_sheet_id 없음 (secrets.toml 또는 환경변수 확인)")
+        else:
+            msgs.append(f"✅ 스프레드시트 ID 있음 (앞 8자: {sid[:8]}…)")
+        cred = _get_sheets_credentials()
+        if not cred:
+            msgs.append("❌ gcp_credentials_json 없거나 파싱 실패 (줄 앞에 # 있으면 제거, JSON은 { 로 시작)")
+        else:
+            msgs.append("✅ 서비스 계정 인증 정보 로드됨")
+        if sid and cred:
+            try:
+                sh = _open_spreadsheet()
+                if sh:
+                    msgs.append("✅ 스프레드시트 열기 성공 → 연동 정상")
+                else:
+                    msgs.append("❌ 스프레드시트 열기 실패 (해당 스프레드시트에 서비스 계정 이메일을 편집자로 공유했는지 확인)")
+            except Exception as e:
+                msgs.append(f"❌ 스프레드시트 접근 오류: {e}")
+        for m in msgs:
+            st.sidebar.write(m)
 
     if st.sidebar.button("지금 뉴스 수집 실행"):
         added_count, source = collect_news_from_naver()
