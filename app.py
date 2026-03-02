@@ -1,10 +1,12 @@
+import json
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from html import unescape
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -12,6 +14,13 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    _SHEETS_AVAILABLE = True
+except ImportError:
+    _SHEETS_AVAILABLE = False
 
 
 st.set_page_config(
@@ -34,6 +43,268 @@ PRESS_NAME_MAP = {
     "chosunbiz": "조선비즈",
     "asiae": "아시아경제",
 }
+
+SHEET_NAMES = ("inbox", "saved", "corrections", "config")
+
+
+def _dt_to_iso(dt: datetime) -> str:
+    return dt.isoformat() if isinstance(dt, datetime) else str(dt)
+
+
+def _iso_to_dt(s: str) -> datetime:
+    if not s:
+        return datetime.now()
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
+
+def _get_sheets_credentials() -> Optional[Dict[str, Any]]:
+    """서비스 계정 인증 정보 반환. st.secrets 또는 .env."""
+    if not _SHEETS_AVAILABLE:
+        return None
+    load_dotenv()
+    # 1) st.secrets: gcp_credentials_json (한 줄 JSON) 또는 [gcp_credentials] 섹션
+    try:
+        raw = ""
+        if hasattr(st.secrets, "get"):
+            raw = st.secrets.get("gcp_credentials_json", "") or ""
+        if not raw and hasattr(st.secrets, "gcp_credentials_json"):
+            raw = getattr(st.secrets, "gcp_credentials_json", "") or ""
+        if hasattr(st.secrets, "to_dict"):
+            raw = raw or st.secrets.to_dict().get("gcp_credentials_json", "")
+        raw = (raw or "").strip().strip("'").strip('"')
+        if raw:
+            if not raw.startswith("{"):
+                raw = "{" + raw
+            if not raw.rstrip().endswith("}"):
+                raw = raw.rstrip() + "}"
+            return json.loads(raw)
+        section = st.secrets.get("gcp_credentials", None) if hasattr(st.secrets, "get") else getattr(st.secrets, "gcp_credentials", None)
+        if isinstance(section, Mapping):
+            d = dict(section)
+            if d.get("private_key"):
+                return d
+        if hasattr(st.secrets, "to_dict"):
+            sec = st.secrets.to_dict()
+            section = sec.get("gcp_credentials", {})
+            if isinstance(section, dict) and section.get("private_key"):
+                return section
+    except Exception:
+        pass
+    return None
+
+
+def _get_sheet_id() -> str:
+    load_dotenv()
+    sid = (
+        os.getenv("GOOGLE_SHEET_ID", "")
+        or os.getenv("google_sheet_id", "")
+        or (st.secrets.get("google_sheet_id", "") if hasattr(st.secrets, "get") else "")
+        or getattr(st.secrets, "google_sheet_id", "")
+        or ""
+    )
+    return str(sid).strip()
+
+
+def _open_spreadsheet():
+    """스프레드시트 열기. 실패 시 None."""
+    if not _SHEETS_AVAILABLE:
+        return None
+    cred_dict = _get_sheets_credentials()
+    sheet_id = _get_sheet_id()
+    if not cred_dict or not sheet_id:
+        return None
+    try:
+        creds = Credentials.from_service_account_info(cred_dict, scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ])
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(sheet_id)
+    except Exception:
+        return None
+
+
+def _ensure_worksheets(sh: Any) -> None:
+    """필요한 시트가 없으면 생성."""
+    if not sh:
+        return
+    try:
+        existing = [ws.title for ws in sh.worksheets()]
+        for name in SHEET_NAMES:
+            if name not in existing:
+                sh.add_worksheet(title=name, rows=500, cols=20)
+    except Exception:
+        pass
+
+
+def load_all_from_sheets() -> Optional[Dict[str, Any]]:
+    """스프레드시트에서 전체 데이터 로드. 실패 시 None."""
+    sh = _open_spreadsheet()
+    if not sh:
+        return None
+    try:
+        _ensure_worksheets(sh)
+        out = {
+            "inbox_articles": [],
+            "saved_articles": [],
+            "correction_items": [],
+            "keywords": ["삼성화재"],
+            "folders": ["보도자료", "기획기사", "위기관리", "경쟁사 동향"],
+        }
+        # inbox
+        try:
+            ws = sh.worksheet("inbox")
+            rows = ws.get_all_records()
+            for r in rows:
+                if not r.get("id"):
+                    continue
+                out["inbox_articles"].append({
+                    "id": r.get("id", ""),
+                    "title": r.get("title", ""),
+                    "press": r.get("press", ""),
+                    "published_at": _iso_to_dt(r.get("published_at", "")),
+                    "link": r.get("link", ""),
+                    "summary": r.get("summary", ""),
+                    "query_keyword": r.get("query_keyword", ""),
+                    "is_negative": str(r.get("is_negative", "")).lower() in ("true", "1", "yes"),
+                    "negative_hits": r.get("negative_hits", ""),
+                    "collected_at": _iso_to_dt(r.get("collected_at", "")),
+                })
+        except Exception:
+            pass
+        # saved
+        try:
+            ws = sh.worksheet("saved")
+            rows = ws.get_all_records()
+            for r in rows:
+                if not r.get("saved_id"):
+                    continue
+                out["saved_articles"].append({
+                    "saved_id": r.get("saved_id", ""),
+                    "article_id": r.get("article_id", ""),
+                    "folder": r.get("folder", ""),
+                    "saved_at": _iso_to_dt(r.get("saved_at", "")),
+                    "title": r.get("title", ""),
+                    "press": r.get("press", ""),
+                    "published_at": _iso_to_dt(r.get("published_at", "")),
+                    "link": r.get("link", ""),
+                    "summary": r.get("summary", ""),
+                    "negative_hits": r.get("negative_hits", ""),
+                })
+        except Exception:
+            pass
+        # corrections
+        try:
+            ws = sh.worksheet("corrections")
+            rows = ws.get_all_records()
+            for r in rows:
+                if not r.get("id"):
+                    continue
+                out["correction_items"].append({
+                    "id": r.get("id", ""),
+                    "article_id": r.get("article_id", ""),
+                    "published_at": _iso_to_dt(r.get("published_at", "")),
+                    "press": r.get("press", ""),
+                    "title": r.get("title", ""),
+                    "link": r.get("link", ""),
+                    "status": r.get("status", "요청됨"),
+                    "memo": r.get("memo", ""),
+                })
+        except Exception:
+            pass
+        # config: keywords, folders
+        try:
+            ws = sh.worksheet("config")
+            rows = ws.get_all_records()
+            for r in rows:
+                k, v = r.get("key", ""), r.get("value", "")
+                if k == "keywords" and v:
+                    out["keywords"] = [x.strip() for x in v.split(",") if x.strip()] or ["삼성화재"]
+                elif k == "folders" and v:
+                    out["folders"] = [x.strip() for x in v.split(",") if x.strip()] or out["folders"]
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return None
+
+
+def save_all_to_sheets() -> bool:
+    """현재 session_state 데이터를 스프레드시트에 저장. 성공 여부 반환."""
+    if not _SHEETS_AVAILABLE:
+        return False
+    sh = _open_spreadsheet()
+    if not sh:
+        return False
+    try:
+        _ensure_worksheets(sh)
+        # inbox
+        ws = sh.worksheet("inbox")
+        ws.clear()
+        rows = [["id", "title", "press", "published_at", "link", "summary", "query_keyword", "is_negative", "negative_hits", "collected_at"]]
+        for a in st.session_state.get("inbox_articles", []):
+            rows.append([
+                a.get("id", ""),
+                a.get("title", ""),
+                a.get("press", ""),
+                _dt_to_iso(a.get("published_at")),
+                a.get("link", ""),
+                a.get("summary", ""),
+                a.get("query_keyword", ""),
+                str(a.get("is_negative", False)),
+                a.get("negative_hits", ""),
+                _dt_to_iso(a.get("collected_at")),
+            ])
+        ws.update(rows, "A1")
+        # saved
+        ws = sh.worksheet("saved")
+        ws.clear()
+        rows = [["saved_id", "article_id", "folder", "saved_at", "title", "press", "published_at", "link", "summary", "negative_hits"]]
+        for a in st.session_state.get("saved_articles", []):
+            rows.append([
+                a.get("saved_id", ""),
+                a.get("article_id", ""),
+                a.get("folder", ""),
+                _dt_to_iso(a.get("saved_at")),
+                a.get("title", ""),
+                a.get("press", ""),
+                _dt_to_iso(a.get("published_at")),
+                a.get("link", ""),
+                a.get("summary", ""),
+                a.get("negative_hits", ""),
+            ])
+        ws.update(rows, "A1")
+        # corrections
+        ws = sh.worksheet("corrections")
+        ws.clear()
+        rows = [["id", "article_id", "published_at", "press", "title", "link", "status", "memo"]]
+        for a in st.session_state.get("correction_items", []):
+            rows.append([
+                a.get("id", ""),
+                a.get("article_id", ""),
+                _dt_to_iso(a.get("published_at")),
+                a.get("press", ""),
+                a.get("title", ""),
+                a.get("link", ""),
+                a.get("status", ""),
+                a.get("memo", ""),
+            ])
+        ws.update(rows, "A1")
+        # config
+        ws = sh.worksheet("config")
+        ws.clear()
+        ws.update([["key", "value"], ["keywords", ",".join(st.session_state.get("keywords", ["삼성화재"]))], ["folders", ",".join(st.session_state.get("folders", []))]], "A1")
+        return True
+    except Exception:
+        return False
+
+
+def sheets_ready() -> bool:
+    """Google Sheets 연동 가능 여부."""
+    return bool(_SHEETS_AVAILABLE and _get_sheets_credentials() and _get_sheet_id())
 
 
 def parse_dt(value: str) -> datetime:
@@ -139,20 +410,21 @@ def get_mock_articles() -> List[Dict]:
 
 
 def init_state() -> None:
-    if "keywords" not in st.session_state:
-        st.session_state.keywords = ["삼성화재"]
-
-    if "folders" not in st.session_state:
-        st.session_state.folders = ["보도자료", "기획기사", "위기관리", "경쟁사 동향"]
-
+    # 첫 로드 시 Google Sheets에서 복원 시도
     if "inbox_articles" not in st.session_state:
-        st.session_state.inbox_articles = []
-
-    if "saved_articles" not in st.session_state:
-        st.session_state.saved_articles = []
-
-    if "correction_items" not in st.session_state:
-        st.session_state.correction_items = []
+        data = load_all_from_sheets() if sheets_ready() else None
+        if data:
+            st.session_state.keywords = data.get("keywords", ["삼성화재"])
+            st.session_state.folders = data.get("folders", ["보도자료", "기획기사", "위기관리", "경쟁사 동향"])
+            st.session_state.inbox_articles = data.get("inbox_articles", [])
+            st.session_state.saved_articles = data.get("saved_articles", [])
+            st.session_state.correction_items = data.get("correction_items", [])
+        else:
+            st.session_state.keywords = ["삼성화재"]
+            st.session_state.folders = ["보도자료", "기획기사", "위기관리", "경쟁사 동향"]
+            st.session_state.inbox_articles = []
+            st.session_state.saved_articles = []
+            st.session_state.correction_items = []
 
     if "alerts" not in st.session_state:
         st.session_state.alerts = []
@@ -184,10 +456,72 @@ def refresh_alerts() -> None:
     st.session_state.alerts = sorted(items, key=lambda x: x["time"], reverse=True)
 
 
-def naver_api_ready() -> bool:
+def _clean_secret_value(value: str) -> str:
+    return str(value).strip().strip('"').strip("'")
+
+
+def get_naver_credentials() -> Tuple[str, str]:
     load_dotenv()
-    client_id = os.getenv("NAVER_CLIENT_ID", "")
-    client_secret = os.getenv("NAVER_CLIENT_SECRET", "")
+
+    # 1) 환경변수(.env)
+    env_client_id = _clean_secret_value(os.getenv("NAVER_CLIENT_ID", ""))
+    env_client_secret = _clean_secret_value(os.getenv("NAVER_CLIENT_SECRET", ""))
+    if env_client_id and env_client_secret:
+        return env_client_id, env_client_secret
+
+    # 2) Streamlit Secrets (루트 키 또는 섹션형 모두 지원)
+    try:
+        secrets_dict = {}
+        if hasattr(st.secrets, "to_dict"):
+            secrets_dict = st.secrets.to_dict()
+
+        root_id = _clean_secret_value(
+            st.secrets.get("NAVER_CLIENT_ID", "")
+            or st.secrets.get("naver_client_id", "")
+            or secrets_dict.get("NAVER_CLIENT_ID", "")
+            or secrets_dict.get("naver_client_id", "")
+        )
+        root_secret = _clean_secret_value(
+            st.secrets.get("NAVER_CLIENT_SECRET", "")
+            or st.secrets.get("naver_client_secret", "")
+            or secrets_dict.get("NAVER_CLIENT_SECRET", "")
+            or secrets_dict.get("naver_client_secret", "")
+        )
+        if root_id and root_secret:
+            return root_id, root_secret
+
+        for section_name in ["naver", "NAVER", "api", "credentials"]:
+            section = st.secrets.get(section_name, None)
+            section_dict = {}
+
+            if isinstance(section, Mapping):
+                section_dict = dict(section)
+            elif hasattr(section, "to_dict"):
+                section_dict = section.to_dict()
+            elif section_name in secrets_dict and isinstance(secrets_dict.get(section_name), Mapping):
+                section_dict = dict(secrets_dict.get(section_name, {}))
+
+            if section_dict:
+                sec_id = _clean_secret_value(
+                    section_dict.get("NAVER_CLIENT_ID", "")
+                    or section_dict.get("naver_client_id", "")
+                    or section_dict.get("client_id", "")
+                )
+                sec_secret = _clean_secret_value(
+                    section_dict.get("NAVER_CLIENT_SECRET", "")
+                    or section_dict.get("naver_client_secret", "")
+                    or section_dict.get("client_secret", "")
+                )
+                if sec_id and sec_secret:
+                    return sec_id, sec_secret
+    except Exception:
+        pass
+
+    return "", ""
+
+
+def naver_api_ready() -> bool:
+    client_id, client_secret = get_naver_credentials()
     return bool(client_id and client_secret)
 
 
@@ -239,9 +573,7 @@ def normalize_press_name(raw_press: str, link: str) -> str:
 
 
 def collect_news_from_naver() -> Tuple[int, str]:
-    load_dotenv()
-    client_id = os.getenv("NAVER_CLIENT_ID", "")
-    client_secret = os.getenv("NAVER_CLIENT_SECRET", "")
+    client_id, client_secret = get_naver_credentials()
 
     if not (client_id and client_secret):
         return 0, "no_key"
@@ -378,8 +710,21 @@ def draw_sidebar() -> str:
         st.sidebar.success("네이버 API 키가 설정되어 있습니다.")
     else:
         st.sidebar.warning(
-            "네이버 API 키가 아직 없습니다.\n`.env`에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET를 설정하세요."
+            "네이버 API 키를 찾지 못했습니다.\n로컬은 `.env`, 배포는 Streamlit `Secrets`를 확인하세요."
         )
+
+    if st.sidebar.button("API 키 인식 상태 점검"):
+        cid, csec = get_naver_credentials()
+        if cid and csec:
+            st.sidebar.success("API 키 인식 성공")
+        else:
+            st.sidebar.error("API 키 인식 실패 (키 이름/배포 재시작 여부 확인 필요)")
+
+    st.sidebar.divider()
+    if sheets_ready():
+        st.sidebar.success("Google Sheets DB 연동됨 (데이터 영구 보존)")
+    else:
+        st.sidebar.caption("Google Sheets 미연동 시 새로고침하면 데이터가 초기화됩니다. 설정: GOOGLE_SHEETS_SETUP.md")
 
     if st.sidebar.button("지금 뉴스 수집 실행"):
         added_count, source = collect_news_from_naver()
@@ -765,6 +1110,13 @@ def main() -> None:
         page_saved_db()
     elif page == "기사 수정 요청 관리":
         page_correction_tracking()
+
+    # 매 실행마다 Google Sheets에 현재 상태 저장 (새로고침 후에도 유지)
+    if sheets_ready():
+        try:
+            save_all_to_sheets()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

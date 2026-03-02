@@ -4,3 +4,5 @@ openpyxl
 python-dotenv
 requests
 streamlit-autorefresh
+gspread
+google-auth
